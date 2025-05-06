@@ -1,9 +1,11 @@
 using System.Collections.Immutable;
+using System.Text.Json;
 using System.Xml.Linq;
 using System.Xml.XPath;
 
 using Microsoft.Build.Logging.StructuredLogger;
 
+using NuGet.Frameworks;
 using NuGet.Versioning;
 
 using NuGetUpdater.Core.Utilities;
@@ -83,6 +85,9 @@ internal static class SdkProjectDiscovery
 
         Dictionary<string, Dictionary<string, Dictionary<string, string>>> packagesReplacedBySdkPerProject = new(PathComparer.Instance);
         //    projectPath                tfm        packageName  packageVersion
+
+        Dictionary<string, Dictionary<string, HashSet<string>>> packageDependencies = new(PathComparer.Instance);
+        //    projectPath                tfm  packageNames
 
         Dictionary<string, Dictionary<string, string>> resolvedProperties = new(PathComparer.Instance);
         //    projectPath       propertyName  propertyValue
@@ -228,6 +233,28 @@ internal static class SdkProjectDiscovery
                                         }
                                     }
                                 }
+
+                                // track all referenced projects in case they have no assemblies and can't be otherwise reported
+                                if (addItem.Name.Equals("PackageDependencies", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    var projectEvaluation = GetNearestProjectEvaluation(node);
+                                    if (projectEvaluation is not null)
+                                    {
+                                        var specificPackageDeps = packageDependencies.GetOrAdd(projectEvaluation.ProjectFile, () => new(StringComparer.OrdinalIgnoreCase));
+                                        var tfm = GetPropertyValueFromProjectEvaluation(projectEvaluation, "TargetFramework");
+                                        if (tfm is not null)
+                                        {
+                                            var packagesByTfm = specificPackageDeps.GetOrAdd(tfm, () => new(StringComparer.OrdinalIgnoreCase));
+                                            foreach (var package in addItem.Children.OfType<Item>())
+                                            {
+                                                if (!NonReportedPackgeNames.Contains(package.Name))
+                                                {
+                                                    packagesByTfm.Add(package.Name);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             break;
                         case Target target when target.Name == "_HandlePackageFileConflicts":
@@ -330,7 +357,7 @@ internal static class SdkProjectDiscovery
         }
 
         // and done
-        var projectDiscoveryResults = BuildResults(
+        var projectDiscoveryResults = await BuildResults(
             repoRootPath,
             workspacePath,
             packagesPerProject,
@@ -338,6 +365,7 @@ internal static class SdkProjectDiscovery
             packagesReplacedBySdkPerProject,
             topLevelPackagesPerProject,
             resolvedProperties,
+            packageDependencies,
             referencedProjects,
             importedFiles,
             additionalFiles
@@ -345,7 +373,7 @@ internal static class SdkProjectDiscovery
         return projectDiscoveryResults;
     }
 
-    private static ImmutableArray<ProjectDiscoveryResult> BuildResults(
+    private static async Task<ImmutableArray<ProjectDiscoveryResult>> BuildResults(
         string repoRootPath,
         string workspacePath,
         Dictionary<string, Dictionary<string, Dictionary<string, string>>> packagesPerProject,
@@ -353,13 +381,14 @@ internal static class SdkProjectDiscovery
         Dictionary<string, Dictionary<string, Dictionary<string, string>>> packagesReplacedBySdkPerProject,
         Dictionary<string, Dictionary<string, HashSet<string>>> topLevelPackagesPerProject,
         Dictionary<string, Dictionary<string, string>> resolvedProperties,
+        Dictionary<string, Dictionary<string, HashSet<string>>> packageDependencies,
         Dictionary<string, HashSet<string>> referencedProjects,
         Dictionary<string, HashSet<string>> importedFiles,
         Dictionary<string, HashSet<string>> additionalFiles
     )
     {
         var projectDiscoveryResults = new List<ProjectDiscoveryResult>();
-        foreach (var projectPath in packagesPerProject.Keys.OrderBy(p => p)) //packagesPerProject.Keys.OrderBy(p => p).Select(projectPath =>
+        foreach (var projectPath in packagesPerProject.Keys.OrderBy(p => p))
         {
             // gather some project-level information
             var packagesByTfm = packagesPerProject[projectPath];
@@ -400,12 +429,56 @@ internal static class SdkProjectDiscovery
                 .SelectMany(kvp => kvp.Value)
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
+            var propertiesForProject = resolvedProperties.GetOrAdd(projectPath, () => new(StringComparer.OrdinalIgnoreCase));
+
             // create dependencies
             var tfms = packagesByTfm.Keys.OrderBy(tfm => tfm).ToImmutableArray();
             var groupedDependencies = new Dictionary<string, Dependency>(StringComparer.OrdinalIgnoreCase);
             foreach (var tfm in tfms)
             {
+                var parsedTfm = NuGetFramework.Parse(tfm);
                 var packages = packagesByTfm[tfm];
+
+                // augment with any packages that might not have reported assemblies
+                var packageDepsForProject = packageDependencies.GetOrAdd(projectPath, () => new(StringComparer.OrdinalIgnoreCase));
+                var packageDepsForTfm = packageDepsForProject.GetOrAdd(tfm, () => new(StringComparer.OrdinalIgnoreCase));
+                foreach (var packageDepName in packageDepsForTfm)
+                {
+                    if (packages.ContainsKey(packageDepName))
+                    {
+                        // we already know about this
+                        continue;
+                    }
+
+                    // otherwise find the corresponding version through project.assets.json
+                    if (propertiesForProject.TryGetValue("ProjectAssetsFile", out var assetsFilePath))
+                    {
+                        var assetsContent = await File.ReadAllTextAsync(assetsFilePath);
+                        var assets = JsonDocument.Parse(assetsContent).RootElement;
+                        foreach (var tfmObject in assets.GetProperty("targets").EnumerateObject())
+                        {
+                            var reportedTargetFramework = NuGetFramework.Parse(tfmObject.Name);
+                            if (reportedTargetFramework != parsedTfm)
+                            {
+                                // not interested in this target framework
+                                continue;
+                            }
+
+                            foreach (var packageObject in tfmObject.Value.EnumerateObject())
+                            {
+                                var parts = packageObject.Name.Split('/');
+                                var packageName = parts[0];
+                                var packageVersion = parts[1];
+                                if (packageName.Equals(packageDepName, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    // found the relevant package => track its version
+                                    packages[packageName] = packageVersion;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 foreach (var package in packages)
                 {
                     var packageName = package.Key;
