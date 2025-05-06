@@ -41,6 +41,8 @@ internal static class SdkProjectDiscovery
     // these packages are resolved during restore, but aren't really updatable and shouldn't be reported as dependencies
     private static readonly HashSet<string> NonReportedPackgeNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
     {
+        "Microsoft.NETCore.Platforms",
+        "Microsoft.NETCore.Targets",
         "NETStandard.Library"
     };
 
